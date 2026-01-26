@@ -1,0 +1,22 @@
+services:
+  luna:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: luna-bot
+    restart: always
+    env_file:
+      - ../.env
+    environment:
+      - LUNA_DATA_DIR=/app/data
+      - LUNA_CREDENTIALS_DIR=/app/credentials
+    volumes:
+      # Persist database and logs
+      - luna-data:/app/data
+      # Mount Google credentials (read-only)
+      - ../credentials:/app/credentials:ro
+    # No ports needed - bot uses polling, not webhooks
+
+volumes:
+  luna-data:
+    name: luna-data
