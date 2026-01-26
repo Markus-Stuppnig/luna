@@ -7,11 +7,10 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from luna.config import (
-    ANTHROPIC_API_KEY, LLM_MODEL, MCP_CALENDAR_DIR,
-    GOOGLE_CREDENTIALS_PATH, GOOGLE_TOKEN_PATH, get_logger
+    ANTHROPIC_API_KEY, LLM_MODEL, MCP_CALENDAR_DIR, MCP_CONTACTS_DIR,
+    GOOGLE_CREDENTIALS_PATH, GOOGLE_TOKEN_PATH, DB_PATH, get_logger
 )
 from luna import memory
-from luna import contacts as gcontacts
 
 # =============================================================================
 # LOGGING SETUP
@@ -148,6 +147,44 @@ async def call_mcp_tool(tool_name: str, arguments: dict = None) -> str:
         logger.error(f"MCP tool call failed: {e}", exc_info=True)
         return f"Fehler beim Abrufen der Kalenderdaten: {str(e)}"
 
+
+async def call_mcp_contacts_tool(tool_name: str, arguments: dict = None) -> str:
+    """Call a tool on the MCP Contacts server."""
+    logger.info(f"call_mcp_contacts_tool() called: {tool_name} with args {arguments}")
+
+    if arguments is None:
+        arguments = {}
+
+    server_params = StdioServerParameters(
+        command="uv",
+        args=["run", "mcp-google-contacts"],
+        cwd=str(MCP_CONTACTS_DIR),
+        env={
+            "GOOGLE_CREDENTIALS_PATH": str(GOOGLE_CREDENTIALS_PATH),
+            "GOOGLE_TOKEN_PATH": str(GOOGLE_TOKEN_PATH),
+            "LUNA_DB_PATH": str(DB_PATH),
+        }
+    )
+
+    try:
+        async with stdio_client(server_params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                logger.info(f"MCP Contacts session initialized, calling tool: {tool_name}")
+
+                result = await session.call_tool(tool_name, arguments)
+
+                if result.content:
+                    text_result = result.content[0].text
+                    logger.info(f"MCP Contacts tool result: {text_result[:100]}...")
+                    return text_result
+                else:
+                    logger.warning("MCP Contacts tool returned no content")
+                    return "Keine Ergebnisse."
+    except Exception as e:
+        logger.error(f"MCP Contacts tool call failed: {e}", exc_info=True)
+        return f"Fehler beim Abrufen der Kontaktdaten: {str(e)}"
+
 SYSTEM_PROMPT = """Du bist Luna, ein persönlicher Assistent für Markus Stuppnig, deinen Chef. Du sprichst Deutsch und bist freundlich, hilfsbereit und prägnant.
 
 Deine Hauptaufgaben:
@@ -169,8 +206,8 @@ Halte deine Antworten sehr kurz und natürlich - wie eine gute Assistentin."""
 logger.debug(f"System prompt loaded ({len(SYSTEM_PROMPT)} characters)")
 
 
-def build_context(user_message: str, calendar_events: list = None, all_contacts: list = None) -> str:
-    """Build context string for the LLM."""
+def build_context(user_message: str, calendar_events: list = None) -> str:
+    """Build context string for the LLM using local contacts from database."""
     logger.info("build_context() called")
 
     context_parts = []
@@ -196,52 +233,52 @@ def build_context(user_message: str, calendar_events: list = None, all_contacts:
             logger.debug(f"Added calendar event to context: {event}")
         logger.info(f"Added {min(len(calendar_events), 10)} calendar events to context")
 
+    # Load contacts from local database
+    logger.info("Loading contacts from local database...")
+    all_contacts = memory.get_all_local_contacts()
+    logger.debug(f"Loaded {len(all_contacts)} contacts from local DB")
+
     logger.info("Extracting potential names from user message...")
     potential_names = user_message.split(" ")
     logger.debug(f"Potential names: {potential_names}")
 
-    relevant_facts = []
     matched_contacts = []
-
-    if all_contacts is None:
-        all_contacts = []
-        logger.debug("No contacts provided, using empty list")
+    contacts_with_notes = []
 
     logger.info(f"Processing {len(potential_names)} potential contact names...")
     for name in potential_names:
+        if len(name) < 2:  # Skip very short words
+            continue
         logger.debug(f"Processing name: {name}")
 
-        # Match against real contacts
+        # Match against local contacts
         for contact in all_contacts:
             if name.lower() in contact['name'].lower():
                 contact_info = f"{contact['name']}"
                 if contact.get('organization'):
                     contact_info += f" ({contact['organization']})"
-                matched_contacts.append(contact_info)
-                logger.debug(f"Matched contact: {contact_info}")
-                break
+                if contact_info not in matched_contacts:
+                    matched_contacts.append(contact_info)
+                    logger.debug(f"Matched contact: {contact_info}")
 
-        # Get stored facts
-        logger.debug(f"Searching for facts about {name}...")
-        facts = memory.get_facts_for_contact(name)
-        logger.debug(f"Found {len(facts)} facts for {name}")
-        for fact in facts:
-            fact_str = f"{name}: {fact['fact']}"
-            relevant_facts.append(fact_str)
-            logger.debug(f"Added fact: {fact_str}")
+                    # If contact has notes, include them
+                    if contact.get('notes'):
+                        contacts_with_notes.append({
+                            "name": contact['name'],
+                            "notes": contact['notes']
+                        })
 
     if matched_contacts:
         context_parts.append("\nErkannte Kontakte:")
         for c in matched_contacts:
             context_parts.append(f"- {c}")
-            print(c)
         logger.info(f"Added {len(matched_contacts)} matched contacts to context")
 
-    if relevant_facts:
-        context_parts.append("\nGespeicherte Fakten:")
-        for fact in relevant_facts:
-            context_parts.append(f"- {fact}")
-        logger.info(f"Added {len(relevant_facts)} relevant facts to context")
+    if contacts_with_notes:
+        context_parts.append("\nGespeicherte Notizen zu Kontakten:")
+        for c in contacts_with_notes:
+            context_parts.append(f"- {c['name']}: {c['notes']}")
+        logger.info(f"Added notes for {len(contacts_with_notes)} contacts to context")
 
     context = "\n".join(context_parts)
     logger.info(f"build_context() complete - {len(context)} characters")
@@ -275,26 +312,69 @@ def parse_save_facts(response: str) -> tuple[str, list[tuple[str, str]]]:
     return clean_response, facts
 
 
-async def chat(user_message: str, calendar_events: list = None) -> str:
+def find_matching_contacts(contact_name: str) -> list[dict]:
+    """Find contacts matching a name. Returns list of matching contacts."""
+    logger.info(f"find_matching_contacts() called for '{contact_name}'")
+    matches = memory.search_contacts_by_name(contact_name)
+    logger.debug(f"Found {len(matches)} matching contacts")
+    return matches
+
+
+def process_facts_for_saving(facts: list[tuple[str, str]]) -> tuple[list[dict], list[dict]]:
+    """
+    Process extracted facts and determine which can be saved directly vs need disambiguation.
+
+    Returns:
+        - auto_save: list of {contact_id, contact_name, fact} - single match, save directly
+        - needs_disambiguation: list of {contact_name, fact, matches} - multiple matches, need user input
+    """
+    logger.info(f"process_facts_for_saving() called with {len(facts)} facts")
+
+    auto_save = []
+    needs_disambiguation = []
+
+    for contact_name, fact in facts:
+        matches = find_matching_contacts(contact_name)
+
+        if len(matches) == 0:
+            logger.warning(f"No contact found for '{contact_name}' - skipping fact")
+            # Could optionally create a notes-only contact here
+            continue
+        elif len(matches) == 1:
+            # Single match - can save directly
+            auto_save.append({
+                "contact_id": matches[0]["id"],
+                "contact_name": matches[0]["name"],
+                "fact": fact
+            })
+            logger.info(f"Single match for '{contact_name}' -> {matches[0]['name']}")
+        else:
+            # Multiple matches - need disambiguation
+            needs_disambiguation.append({
+                "contact_name": contact_name,
+                "fact": fact,
+                "matches": matches
+            })
+            logger.info(f"Multiple matches for '{contact_name}' - needs disambiguation")
+
+    return auto_save, needs_disambiguation
+
+
+async def chat(user_message: str, calendar_events: list = None) -> tuple[str, list[dict]]:
     """
     Send a message to Claude and get a response.
     Handles tool use for calendar and fact extraction/storage.
+
+    Returns:
+        - response: The clean response text
+        - needs_disambiguation: List of facts that need user disambiguation
     """
     logger.info("=" * 60)
     logger.info("chat() called")
 
-    # Load contacts once
-    logger.info("Attempting to load Google contacts...")
-    try:
-        all_contacts = gcontacts.get_all_contacts()
-        logger.info(f"Loaded {len(all_contacts)} contacts successfully")
-    except Exception as e:
-        logger.warning(f"Failed to load contacts: {e}", exc_info=True)
-        all_contacts = []
-
-    # Build context with contacts (no longer passing calendar_events - LLM will fetch via tools)
+    # Build context using local contacts from database
     logger.info("Building context for LLM...")
-    context = build_context(user_message, None, all_contacts)
+    context = build_context(user_message, None)
     logger.debug(f"Context built ({len(context)} characters)")
 
     # Get conversation history
@@ -372,16 +452,23 @@ async def chat(user_message: str, calendar_events: list = None) -> str:
         logger.warning("Max iterations reached in tool use loop")
         assistant_message = "Entschuldigung, ich hatte Probleme bei der Verarbeitung deiner Anfrage."
 
-    # Parse and save any facts
+    # Parse and process facts
     logger.info("Parsing response for SAVE_FACT commands...")
     clean_response, facts = parse_save_facts(assistant_message)
 
+    needs_disambiguation = []
     if facts:
-        logger.info(f"Saving {len(facts)} extracted facts...")
-        for contact, fact in facts:
-            logger.debug(f"Saving fact: {contact} -> {fact}")
-            memory.add_fact(contact, fact, context=user_message)
-            logger.info(f"Fact saved for {contact}")
+        logger.info(f"Processing {len(facts)} extracted facts...")
+        auto_save, needs_disambiguation = process_facts_for_saving(facts)
+
+        # Save facts that have a single match
+        for item in auto_save:
+            logger.debug(f"Auto-saving fact to contact {item['contact_id']}: {item['fact']}")
+            memory.update_contact_notes(item['contact_id'], item['fact'], append=True)
+            logger.info(f"Fact saved for {item['contact_name']}")
+
+        if needs_disambiguation:
+            logger.info(f"{len(needs_disambiguation)} facts need disambiguation")
     else:
         logger.debug("No facts to save")
 
@@ -394,7 +481,7 @@ async def chat(user_message: str, calendar_events: list = None) -> str:
     logger.info("Conversation saved successfully")
 
     logger.info(f"chat() returning response ({len(clean_response)} characters)")
-    return clean_response
+    return clean_response, needs_disambiguation
 
 
 async def generate_daily_summary(calendar_events: str, contacts_with_facts: list = None) -> str:

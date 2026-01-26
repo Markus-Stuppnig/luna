@@ -1,6 +1,8 @@
 import asyncio
+import hashlib
 import sqlite3
 from telebot.async_telebot import AsyncTeleBot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from luna.config import (
     TELEGRAM_BOT_TOKEN, ALLOWED_USER_IDS, DAILY_SUMMARY_HOUR,
@@ -8,6 +10,10 @@ from luna.config import (
 )
 from luna import llm
 from luna import memory
+
+# Temporary storage for pending facts that need disambiguation
+# Format: {fact_hash: {"fact": str, "matches": list, "timestamp": float}}
+pending_facts: dict[str, dict] = {}
 
 # =============================================================================
 # LOGGING SETUP
@@ -76,6 +82,12 @@ async def send_welcome(message):
         "- Deinen Kalender checken (/heute, /morgen)\n"
         "- Mir Dinge über deine Kontakte merken\n"
         "- Dir jeden Morgen eine Zusammenfassung schicken\n\n"
+        "Befehle:\n"
+        "/kontakte - Kontakte von Google synchronisieren\n"
+        "/fakten - Gespeicherte Notizen anzeigen\n"
+        "/kontakt <name> - Kontakt suchen\n"
+        "/heute, /morgen - Kalender-Events\n"
+        "/clear - Konversation löschen\n\n"
         "Schreib mir einfach oder schick eine Sprachnachricht!"
     )
     logger.info("Welcome message sent successfully")
@@ -137,7 +149,7 @@ async def tomorrow_events(message):
 
 @bot.message_handler(commands=['fakten'])
 async def list_facts(message):
-    """List all stored facts."""
+    """List all contacts with notes."""
     logger.info("=" * 60)
     logger.info("/fakten command received")
     logger.debug(f"Chat ID: {message.chat.id}")
@@ -147,23 +159,22 @@ async def list_facts(message):
         logger.warning("Unauthorized /fakten request - ignoring")
         return
 
-    logger.info("Searching for all facts in memory...")
-    facts = memory.search_facts("")
-    logger.debug(f"Found {len(facts)} facts total")
+    logger.info("Fetching contacts with notes...")
+    contacts = memory.get_contacts_with_notes()
+    logger.debug(f"Found {len(contacts)} contacts with notes")
 
-    if facts:
-        logger.debug(f"First 5 facts: {facts[:5]}")
-        response = "Gespeicherte Fakten:\n\n"
-        for f in facts[:20]:  # Limit to 20
-            response += f"- {f['contact_name'].title()}: {f['fact']}\n"
-            logger.debug(f"Added fact: {f['contact_name']} - {f['fact'][:50]}...")
-        logger.info(f"Sending {min(len(facts), 20)} facts to user")
-        await bot.reply_to(message, response)
-        logger.debug("Facts response sent")
+    if contacts:
+        response = "Gespeicherte Notizen:\n\n"
+        for c in contacts[:20]:  # Limit to 20
+            response += f"**{c['name']}**\n{c['notes']}\n\n"
+            logger.debug(f"Added notes for: {c['name']}")
+        logger.info(f"Sending notes for {min(len(contacts), 20)} contacts to user")
+        await bot.reply_to(message, response, parse_mode="Markdown")
+        logger.debug("Notes response sent")
     else:
-        logger.info("No facts found - sending empty response")
-        await bot.reply_to(message, "Noch keine Fakten gespeichert!")
-        logger.debug("Empty facts response sent")
+        logger.info("No notes found - sending empty response")
+        await bot.reply_to(message, "Noch keine Notizen zu Kontakten gespeichert!\n\nNutze /kontakte um Kontakte von Google zu synchronisieren.")
+        logger.debug("Empty notes response sent")
 
 
 @bot.message_handler(commands=['kontakt'])
@@ -215,6 +226,32 @@ async def search_contact(message):
         logger.debug("No results response sent")
 
 
+@bot.message_handler(commands=['kontakte'])
+async def sync_contacts(message):
+    """Sync contacts from Google to local database."""
+    logger.info("=" * 60)
+    logger.info("/kontakte command received")
+    logger.debug(f"Chat ID: {message.chat.id}")
+    logger.debug(f"User: {message.from_user.id} ({message.from_user.username})")
+
+    if not is_authorized(message):
+        logger.warning("Unauthorized /kontakte request - ignoring")
+        return
+
+    await bot.send_chat_action(message.chat.id, 'typing')
+
+    try:
+        logger.info("Calling MCP contacts sync tool...")
+        result = await llm.call_mcp_contacts_tool("sync_contacts")
+        logger.debug(f"Sync result: {result}")
+
+        await bot.reply_to(message, result)
+        logger.info("Contacts sync completed")
+    except Exception as e:
+        logger.error(f"Contacts sync error: {str(e)}", exc_info=True)
+        await bot.reply_to(message, f"Fehler beim Synchronisieren: {str(e)}")
+
+
 @bot.message_handler(commands=['clear'])
 async def clear_context(message):
     """Clear conversation history."""
@@ -247,6 +284,96 @@ async def clear_context(message):
     logger.info("Clear confirmation sent to user")
 
 
+async def show_contact_disambiguation(chat_id: int, disambiguation_item: dict) -> None:
+    """Show inline buttons to select correct contact for a fact."""
+    import time
+
+    fact = disambiguation_item["fact"]
+    matches = disambiguation_item["matches"]
+    contact_name = disambiguation_item["contact_name"]
+
+    # Create a hash for this pending fact
+    fact_hash = hashlib.md5(f"{fact}{time.time()}".encode()).hexdigest()[:8]
+
+    # Store pending fact
+    pending_facts[fact_hash] = {
+        "fact": fact,
+        "matches": matches,
+        "timestamp": time.time()
+    }
+
+    # Create inline keyboard
+    markup = InlineKeyboardMarkup()
+    for contact in matches[:5]:  # Limit to 5 options
+        org_str = f" ({contact.get('organization', '')})" if contact.get('organization') else ""
+        btn = InlineKeyboardButton(
+            text=f"{contact['name']}{org_str}",
+            callback_data=f"sf:{contact['id']}:{fact_hash}"
+        )
+        markup.add(btn)
+
+    # Add cancel button
+    markup.add(InlineKeyboardButton(text="Abbrechen", callback_data=f"sf:cancel:{fact_hash}"))
+
+    await bot.send_message(
+        chat_id,
+        f"Mehrere Kontakte gefunden für '{contact_name}'.\nWelcher ist gemeint?\n\nFakt: {fact}",
+        reply_markup=markup
+    )
+    logger.info(f"Sent disambiguation buttons for fact_hash {fact_hash}")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("sf:"))
+async def handle_save_fact_callback(call):
+    """Handle contact selection for fact saving."""
+    logger.info("=" * 60)
+    logger.info("Callback query received for fact saving")
+    logger.debug(f"Callback data: {call.data}")
+
+    parts = call.data.split(":")
+    if len(parts) != 3:
+        logger.error(f"Invalid callback data format: {call.data}")
+        await bot.answer_callback_query(call.id, "Fehler: Ungültiges Format")
+        return
+
+    contact_id_str = parts[1]
+    fact_hash = parts[2]
+
+    # Handle cancel
+    if contact_id_str == "cancel":
+        pending_facts.pop(fact_hash, None)
+        await bot.answer_callback_query(call.id, "Abgebrochen")
+        await bot.delete_message(call.message.chat.id, call.message.message_id)
+        logger.info("Fact saving cancelled by user")
+        return
+
+    # Get pending fact data
+    fact_data = pending_facts.pop(fact_hash, None)
+    if not fact_data:
+        await bot.answer_callback_query(call.id, "Fakt nicht mehr verfügbar")
+        await bot.delete_message(call.message.chat.id, call.message.message_id)
+        logger.warning(f"Pending fact {fact_hash} not found")
+        return
+
+    # Save fact to selected contact
+    try:
+        contact_id = int(contact_id_str)
+        success = memory.update_contact_notes(contact_id, fact_data["fact"], append=True)
+
+        if success:
+            await bot.answer_callback_query(call.id, "Fakt gespeichert!")
+            logger.info(f"Fact saved to contact {contact_id}")
+        else:
+            await bot.answer_callback_query(call.id, "Fehler beim Speichern")
+            logger.error(f"Failed to save fact to contact {contact_id}")
+
+        await bot.delete_message(call.message.chat.id, call.message.message_id)
+
+    except ValueError as e:
+        logger.error(f"Invalid contact_id: {contact_id_str}")
+        await bot.answer_callback_query(call.id, "Fehler: Ungültige Kontakt-ID")
+
+
 @bot.message_handler(func=lambda message: True)
 async def handle_text(message):
     """Handle all text messages."""
@@ -273,15 +400,21 @@ async def handle_text(message):
         logger.info("Calling LLM for response...")
         logger.debug(f"User message: {message.text}")
 
-        response = await llm.chat(message.text)
+        response, needs_disambiguation = await llm.chat(message.text)
 
         logger.info("LLM response received")
         logger.debug(f"Response length: {len(response)} characters")
         logger.debug(f"Response preview: {response[:200]}..." if len(response) > 200 else f"Response: {response}")
+        logger.debug(f"Needs disambiguation: {len(needs_disambiguation)} items")
 
         logger.info("Sending response to user...")
         await bot.reply_to(message, response)
         logger.info("Response sent successfully")
+
+        # Handle any facts that need disambiguation
+        for item in needs_disambiguation:
+            logger.info(f"Showing disambiguation for '{item['contact_name']}'")
+            await show_contact_disambiguation(message.chat.id, item)
 
     except Exception as e:
         logger.error(f"Error handling text message: {str(e)}", exc_info=True)

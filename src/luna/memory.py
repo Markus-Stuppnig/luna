@@ -1,4 +1,6 @@
 import sqlite3
+import json
+from datetime import datetime
 from luna.config import DB_PATH, get_logger
 
 # =============================================================================
@@ -43,6 +45,29 @@ def init_db():
         )
     """)
     logger.debug("Conversations table created/verified")
+
+    # Contacts table - cached from Google Contacts with local notes
+    logger.info("Creating 'contacts' table if not exists...")
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS contacts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            google_id TEXT UNIQUE,
+            name TEXT NOT NULL,
+            emails TEXT,
+            phones TEXT,
+            organization TEXT,
+            notes TEXT,
+            synced_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    logger.debug("Contacts table created/verified")
+
+    # Create index for faster name lookups
+    c.execute("CREATE INDEX IF NOT EXISTS idx_contacts_name ON contacts(name)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_contacts_google_id ON contacts(google_id)")
+    logger.debug("Contacts indexes created/verified")
 
     conn.commit()
     logger.debug("Schema changes committed")
@@ -257,6 +282,244 @@ def get_recent_conversations(limit: int = 20) -> list[dict]:
         logger.debug(f"Conversation {i+1}: [{r['role']}] {r['content'][:50]}...")
 
     return result
+
+
+# =============================================================================
+# CONTACTS FUNCTIONS
+# =============================================================================
+
+def upsert_contact(google_id: str, name: str, emails: list, phones: list, organization: str = None) -> int:
+    """Insert or update a contact from Google. Returns contact ID."""
+    logger.info(f"upsert_contact() called for '{name}'")
+    logger.debug(f"google_id: {google_id}")
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    emails_json = json.dumps(emails) if emails else None
+    phones_json = json.dumps(phones) if phones else None
+    now = datetime.now().isoformat()
+
+    # Check if contact exists
+    c.execute("SELECT id, notes FROM contacts WHERE google_id = ?", (google_id,))
+    existing = c.fetchone()
+
+    if existing:
+        contact_id = existing[0]
+        # Update but preserve notes
+        c.execute("""
+            UPDATE contacts
+            SET name = ?, emails = ?, phones = ?, organization = ?, synced_at = ?, updated_at = ?
+            WHERE google_id = ?
+        """, (name, emails_json, phones_json, organization, now, now, google_id))
+        logger.debug(f"Updated existing contact ID {contact_id}")
+    else:
+        c.execute("""
+            INSERT INTO contacts (google_id, name, emails, phones, organization, synced_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (google_id, name, emails_json, phones_json, organization, now, now, now))
+        contact_id = c.lastrowid
+        logger.debug(f"Inserted new contact ID {contact_id}")
+
+    conn.commit()
+    conn.close()
+
+    return contact_id
+
+
+def get_contact_by_id(contact_id: int) -> dict | None:
+    """Get a contact by ID."""
+    logger.debug(f"get_contact_by_id() called for ID {contact_id}")
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    c.execute("""
+        SELECT id, google_id, name, emails, phones, organization, notes, synced_at, created_at, updated_at
+        FROM contacts WHERE id = ?
+    """, (contact_id,))
+    row = c.fetchone()
+    conn.close()
+
+    if row:
+        return {
+            "id": row[0],
+            "google_id": row[1],
+            "name": row[2],
+            "emails": json.loads(row[3]) if row[3] else [],
+            "phones": json.loads(row[4]) if row[4] else [],
+            "organization": row[5],
+            "notes": row[6],
+            "synced_at": row[7],
+            "created_at": row[8],
+            "updated_at": row[9]
+        }
+    return None
+
+
+def search_contacts_by_name(query: str) -> list[dict]:
+    """Search contacts by name (case-insensitive, partial match)."""
+    logger.info(f"search_contacts_by_name() called with query='{query}'")
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    search_pattern = f"%{query}%"
+    c.execute("""
+        SELECT id, google_id, name, emails, phones, organization, notes
+        FROM contacts WHERE name LIKE ? COLLATE NOCASE
+        ORDER BY name
+    """, (search_pattern,))
+    rows = c.fetchall()
+    conn.close()
+
+    result = [{
+        "id": r[0],
+        "google_id": r[1],
+        "name": r[2],
+        "emails": json.loads(r[3]) if r[3] else [],
+        "phones": json.loads(r[4]) if r[4] else [],
+        "organization": r[5],
+        "notes": r[6]
+    } for r in rows]
+
+    logger.debug(f"Found {len(result)} contacts matching '{query}'")
+    return result
+
+
+def get_all_local_contacts() -> list[dict]:
+    """Get all locally cached contacts."""
+    logger.info("get_all_local_contacts() called")
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    c.execute("""
+        SELECT id, google_id, name, emails, phones, organization, notes
+        FROM contacts ORDER BY name
+    """)
+    rows = c.fetchall()
+    conn.close()
+
+    result = [{
+        "id": r[0],
+        "google_id": r[1],
+        "name": r[2],
+        "emails": json.loads(r[3]) if r[3] else [],
+        "phones": json.loads(r[4]) if r[4] else [],
+        "organization": r[5],
+        "notes": r[6]
+    } for r in rows]
+
+    logger.debug(f"Returning {len(result)} total contacts")
+    return result
+
+
+def get_contacts_with_notes() -> list[dict]:
+    """Get all contacts that have notes."""
+    logger.info("get_contacts_with_notes() called")
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    c.execute("""
+        SELECT id, google_id, name, emails, phones, organization, notes
+        FROM contacts
+        WHERE notes IS NOT NULL AND notes != ''
+        ORDER BY name
+    """)
+    rows = c.fetchall()
+    conn.close()
+
+    result = [{
+        "id": r[0],
+        "google_id": r[1],
+        "name": r[2],
+        "emails": json.loads(r[3]) if r[3] else [],
+        "phones": json.loads(r[4]) if r[4] else [],
+        "organization": r[5],
+        "notes": r[6]
+    } for r in rows]
+
+    logger.info(f"Found {len(result)} contacts with notes")
+    return result
+
+
+def update_contact_notes(contact_id: int, notes: str, append: bool = True) -> bool:
+    """Update or append to a contact's notes. Returns success status."""
+    logger.info(f"update_contact_notes() called for contact ID {contact_id}")
+    logger.debug(f"append={append}, notes length={len(notes)}")
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    if append:
+        # Get existing notes
+        c.execute("SELECT notes FROM contacts WHERE id = ?", (contact_id,))
+        row = c.fetchone()
+        if not row:
+            conn.close()
+            logger.warning(f"Contact ID {contact_id} not found")
+            return False
+
+        existing_notes = row[0] or ""
+        timestamp = datetime.now().strftime("%Y-%m-%d")
+        new_entry = f"{timestamp}: {notes}"
+
+        if existing_notes:
+            updated_notes = f"{existing_notes}\n{new_entry}"
+        else:
+            updated_notes = new_entry
+    else:
+        updated_notes = notes
+
+    now = datetime.now().isoformat()
+    c.execute("UPDATE contacts SET notes = ?, updated_at = ? WHERE id = ?", (updated_notes, now, contact_id))
+
+    success = c.rowcount > 0
+    conn.commit()
+    conn.close()
+
+    logger.info(f"Notes updated: {success}")
+    return success
+
+
+def delete_contacts_not_in_google_without_notes(google_ids: set) -> int:
+    """Delete contacts that are no longer in Google AND have no notes. Returns count deleted."""
+    logger.info(f"delete_contacts_not_in_google_without_notes() called with {len(google_ids)} Google IDs")
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    # Find contacts not in Google IDs list and without notes
+    placeholders = ",".join("?" * len(google_ids)) if google_ids else "''"
+    query = f"""
+        DELETE FROM contacts
+        WHERE google_id NOT IN ({placeholders})
+        AND (notes IS NULL OR notes = '')
+    """
+
+    if google_ids:
+        c.execute(query, tuple(google_ids))
+    else:
+        c.execute("DELETE FROM contacts WHERE notes IS NULL OR notes = ''")
+
+    deleted_count = c.rowcount
+    conn.commit()
+    conn.close()
+
+    logger.info(f"Deleted {deleted_count} contacts no longer in Google (without notes)")
+    return deleted_count
+
+
+def get_local_google_ids() -> set:
+    """Get all Google IDs currently in local database."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT google_id FROM contacts WHERE google_id IS NOT NULL")
+    ids = {row[0] for row in c.fetchall()}
+    conn.close()
+    return ids
 
 
 # Initialize DB on import

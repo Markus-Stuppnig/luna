@@ -23,6 +23,9 @@ CREDENTIALS_DIR = Path(os.getenv("LUNA_CREDENTIALS_DIR", PROJECT_ROOT / "credent
 # MCP Calendar directory
 MCP_CALENDAR_DIR = PROJECT_ROOT / "mcp_calendar"
 
+# MCP Contacts directory
+MCP_CONTACTS_DIR = PROJECT_ROOT / "mcp_contacts"
+
 # =============================================================================
 # LOGGING CONFIGURATION
 # =============================================================================
