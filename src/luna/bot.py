@@ -462,6 +462,32 @@ async def send_daily_summary():
         logger.error(f"Exception type: {type(e).__name__}")
 
 
+async def check_reminders():
+    """Check for due reminders and send them."""
+    logger.debug("check_reminders() triggered")
+
+    if not USER_CHAT_ID:
+        logger.warning("USER_CHAT_ID not configured - skipping reminder check")
+        return
+
+    try:
+        due_reminders = memory.get_due_reminders()
+
+        for reminder in due_reminders:
+            logger.info(f"Sending reminder {reminder['id']}: {reminder['message']}")
+
+            await bot.send_message(
+                USER_CHAT_ID,
+                f"⏰ Erinnerung: {reminder['message']}"
+            )
+
+            memory.mark_reminder_sent(reminder['id'])
+            logger.debug(f"Reminder {reminder['id']} marked as sent")
+
+    except Exception as e:
+        logger.error(f"Reminder check error: {str(e)}", exc_info=True)
+
+
 async def main():
     logger.info("=" * 80)
     logger.info("MAIN FUNCTION STARTING")
@@ -476,6 +502,15 @@ async def main():
         minute=DAILY_SUMMARY_MINUTE
     )
     logger.debug("Daily summary job added to scheduler")
+
+    # Schedule reminder checker (every 30 seconds)
+    logger.info("Scheduling reminder check job (every 30 seconds)")
+    scheduler.add_job(
+        check_reminders,
+        'interval',
+        seconds=30
+    )
+    logger.debug("Reminder check job added to scheduler")
 
     logger.info("Starting scheduler...")
     scheduler.start()

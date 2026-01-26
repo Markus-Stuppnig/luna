@@ -64,6 +64,19 @@ def init_db():
     """)
     logger.debug("Contacts table created/verified")
 
+    # Reminders table - time-based notifications
+    logger.info("Creating 'reminders' table if not exists...")
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS reminders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message TEXT NOT NULL,
+            remind_at TIMESTAMP NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            sent BOOLEAN DEFAULT FALSE
+        )
+    """)
+    logger.debug("Reminders table created/verified")
+
     # Create index for faster name lookups
     c.execute("CREATE INDEX IF NOT EXISTS idx_contacts_name ON contacts(name)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_contacts_google_id ON contacts(google_id)")
@@ -520,6 +533,102 @@ def get_local_google_ids() -> set:
     ids = {row[0] for row in c.fetchall()}
     conn.close()
     return ids
+
+
+# =============================================================================
+# REMINDER FUNCTIONS
+# =============================================================================
+
+def add_reminder(message: str, remind_at: datetime) -> int:
+    """Create a new reminder. Returns reminder ID."""
+    logger.info(f"add_reminder() called: '{message}' at {remind_at}")
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    c.execute(
+        "INSERT INTO reminders (message, remind_at) VALUES (?, ?)",
+        (message, remind_at.isoformat())
+    )
+
+    reminder_id = c.lastrowid
+    conn.commit()
+    conn.close()
+
+    logger.info(f"Reminder created with ID {reminder_id}")
+    return reminder_id
+
+
+def get_due_reminders() -> list[dict]:
+    """Get all reminders that are due and not yet sent."""
+    logger.debug("get_due_reminders() called")
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    now = datetime.now().isoformat()
+    c.execute(
+        "SELECT id, message, remind_at FROM reminders WHERE remind_at <= ? AND sent = FALSE",
+        (now,)
+    )
+
+    rows = c.fetchall()
+    conn.close()
+
+    result = [{"id": r[0], "message": r[1], "remind_at": r[2]} for r in rows]
+    logger.debug(f"Found {len(result)} due reminders")
+    return result
+
+
+def mark_reminder_sent(reminder_id: int):
+    """Mark a reminder as sent."""
+    logger.info(f"mark_reminder_sent() called for ID {reminder_id}")
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    c.execute("UPDATE reminders SET sent = TRUE WHERE id = ?", (reminder_id,))
+
+    conn.commit()
+    conn.close()
+
+    logger.debug(f"Reminder {reminder_id} marked as sent")
+
+
+def get_pending_reminders() -> list[dict]:
+    """Get all pending (unsent) reminders."""
+    logger.debug("get_pending_reminders() called")
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    c.execute(
+        "SELECT id, message, remind_at FROM reminders WHERE sent = FALSE ORDER BY remind_at"
+    )
+
+    rows = c.fetchall()
+    conn.close()
+
+    result = [{"id": r[0], "message": r[1], "remind_at": r[2]} for r in rows]
+    logger.debug(f"Found {len(result)} pending reminders")
+    return result
+
+
+def delete_reminder(reminder_id: int) -> bool:
+    """Delete a reminder. Returns True if deleted."""
+    logger.info(f"delete_reminder() called for ID {reminder_id}")
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    c.execute("DELETE FROM reminders WHERE id = ?", (reminder_id,))
+
+    deleted = c.rowcount > 0
+    conn.commit()
+    conn.close()
+
+    logger.debug(f"Reminder {reminder_id} deleted: {deleted}")
+    return deleted
 
 
 # Initialize DB on import

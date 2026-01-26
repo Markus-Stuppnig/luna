@@ -107,6 +107,24 @@ CALENDAR_TOOLS = [
             },
             "required": ["title", "start_datetime"]
         }
+    },
+    {
+        "name": "create_reminder",
+        "description": "Erstellt eine Erinnerung. Luna sendet zur angegebenen Zeit eine Nachricht. Nutze bei 'erinnere mich an...' oder 'reminder'.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "description": "Woran erinnert werden soll"
+                },
+                "remind_at": {
+                    "type": "string",
+                    "description": "Wann erinnern im ISO Format YYYY-MM-DDTHH:MM"
+                }
+            },
+            "required": ["message", "remind_at"]
+        }
     }
 ]
 
@@ -185,23 +203,60 @@ async def call_mcp_contacts_tool(tool_name: str, arguments: dict = None) -> str:
         logger.error(f"MCP Contacts tool call failed: {e}", exc_info=True)
         return f"Fehler beim Abrufen der Kontaktdaten: {str(e)}"
 
-SYSTEM_PROMPT = """Du bist Luna, ein persönlicher Assistent für Markus Stuppnig, deinen Chef. Du sprichst Deutsch und bist freundlich, hilfsbereit und prägnant.
 
-Deine Hauptaufgaben:
-1. Allgemeine Fragen beantworten
-2. Kalender-Informationen bereitstellen
-3. Dich an persönliche Details über Kontakte erinnern und diese nutzen
+async def handle_create_reminder(arguments: dict) -> str:
+    """Handle the create_reminder tool call locally."""
+    logger.info(f"handle_create_reminder() called with args {arguments}")
 
-WICHTIG - Kontakt-Informationen speichern:
-Wenn der Nutzer dir etwas über eine Person erzählt (z.B. "Julias Freundin Lara hat sich das Bein gebrochen"),
-antworte mit einem speziellen Format am ENDE deiner Antwort:
-[SAVE_FACT|Kontaktname|Fakt]
+    message = arguments.get("message", "")
+    remind_at_str = arguments.get("remind_at", "")
 
-Beispiel: "Das tut mir leid zu hören! Ich hoffe, Lara erholt sich schnell. [SAVE_FACT|Julia|Freundin Lara hat sich das Bein gebrochen]"
+    if not message or not remind_at_str:
+        return "Fehler: message und remind_at sind erforderlich."
 
-Wenn relevante Kontakt-Informationen im Kontext sind, erinnere den Nutzer daran und schlage vor, nachzufragen.
+    try:
+        # Parse the datetime
+        remind_at = datetime.fromisoformat(remind_at_str)
 
-Halte deine Antworten sehr kurz und natürlich - wie eine gute Assistentin."""
+        # Add timezone if not present
+        TIMEZONE = ZoneInfo("Europe/Vienna")
+        if remind_at.tzinfo is None:
+            remind_at = remind_at.replace(tzinfo=TIMEZONE)
+
+        # Create the reminder
+        reminder_id = memory.add_reminder(message, remind_at)
+
+        # Format for user
+        remind_at_local = remind_at.astimezone(TIMEZONE)
+        time_str = remind_at_local.strftime("%d.%m. um %H:%M")
+
+        return f"Erinnerung erstellt: '{message}' am {time_str}"
+
+    except ValueError as e:
+        logger.error(f"Invalid datetime format: {remind_at_str}")
+        return f"Fehler: Ungültiges Datumsformat. Bitte YYYY-MM-DDTHH:MM verwenden."
+    except Exception as e:
+        logger.error(f"Failed to create reminder: {e}", exc_info=True)
+        return f"Fehler beim Erstellen der Erinnerung: {str(e)}"
+
+
+SYSTEM_PROMPT = """Du bist Luna, persönliche Assistentin von Markus. Antworte immer auf Deutsch.
+
+Stil: Direkt, locker, keine Floskeln. Max 1-2 Sätze. Komm sofort zum Punkt.
+
+Deine Tools:
+- Kalender: Termine abrufen/erstellen
+- Kontakte: Notizen zu Personen speichern
+- Erinnerungen: create_reminder für "erinnere mich an..."
+
+Erinnerungen:
+Bei "erinnere mich in X an Y" → berechne remind_at aus aktueller Zeit + X.
+Beispiele: "in 2 Stunden" → jetzt + 2h, "morgen um 9" → nächster Tag 09:00
+
+Fakten speichern:
+Wenn Markus was über jemanden erzählt: [SAVE_FACT|Name|Fakt]
+
+Nutze gespeicherte Infos wenn relevant."""
 
 logger.debug(f"System prompt loaded ({len(SYSTEM_PROMPT)} characters)")
 
@@ -389,7 +444,7 @@ async def chat(user_message: str, calendar_events: list = None) -> tuple[str, li
         messages.append({"role": msg["role"], "content": msg["content"]})
         logger.debug(f"Added history message: {msg['role']}")
 
-    user_content = f"{context}\n\nNutzer: {user_message}"
+    user_content = f"{user_message}\n\n[Kontext: {context}]"
     messages.append({"role": "user", "content": user_content})
     logger.debug(f"Added current user message ({len(user_content)} characters)")
     logger.info(f"Total messages for API: {len(messages)}")
@@ -426,8 +481,12 @@ async def chat(user_message: str, calendar_events: list = None) -> tuple[str, li
 
                     logger.info(f"Tool call requested: {tool_name} with input {tool_input}")
 
-                    # Call the MCP server
-                    result = await call_mcp_tool(tool_name, tool_input)
+                    # Handle reminder tool locally, others via MCP
+                    if tool_name == "create_reminder":
+                        result = await handle_create_reminder(tool_input)
+                    else:
+                        # Call the MCP server
+                        result = await call_mcp_tool(tool_name, tool_input)
 
                     tool_results.append({
                         "type": "tool_result",
