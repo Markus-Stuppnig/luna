@@ -13,8 +13,8 @@ services:
     volumes:
       # Persist database and logs
       - luna-data:/app/data
-      # Mount Google credentials (read-only)
-      - ../credentials:/app/credentials:ro
+      # Mount Google credentials (writable for token refresh)
+      - ../credentials:/app/credentials
     # No ports needed - bot uses polling, not webhooks
 
 volumes:
