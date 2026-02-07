@@ -553,15 +553,13 @@ async def generate_daily_summary(calendar_events: str, contacts_with_facts: list
     events_str = calendar_events if calendar_events else '- Keine Termine'
     facts_str = '\n'.join(['- ' + c for c in contacts_with_facts]) if contacts_with_facts else '- Keine besonderen Erinnerungen'
 
-    prompt = f"""Erstelle eine kurze Morgenzusammenfassung für den Tag.
+    prompt = f"""Kurzer Tagesüberblick.
 
-Kalender-Events heute:
-{events_str}
+Termine: {events_str}
 
-Erinnerungen an Kontakte die heute relevant sein könnten:
-{facts_str}
+Notizen: {facts_str}
 
-Halte es kurz, freundlich und hilfreich. Maximal 3-4 Sätze."""
+Max 1-2 Sätze, nur das Wichtigste."""
 
     logger.debug(f"Generated prompt ({len(prompt)} characters):")
     logger.debug(prompt)
